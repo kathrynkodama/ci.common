@@ -53,6 +53,7 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Scanner;
 import java.util.Set;
 import java.util.concurrent.RejectedExecutionException;
@@ -86,6 +87,16 @@ public abstract class DevUtil {
     private static final String WEB_APP_AVAILABLE_MESSAGE_PREFIX = "CWWKT0016I:";
     private static final String LISTENING_ON_PORT_MESSAGE_PREFIX = "CWWKO0219I:";
     private static final String HTTP_PREFIX = "http://";
+
+    private static final String[] IGNORE_DIRECTORY_PREFIXES = new String[]{ "." };
+    private static final String[] IGNORE_FILE_PREFIXES = new String[]{ "." };
+    private static final String[] IGNORE_FILE_POSTFIXES = new String[] {
+            // core dumps
+            ".dmp",
+            // vim
+            "~",
+            // intellij
+            "___jb_tmp___", "___jb_old___" };
 
     /**
      * Log debug
@@ -200,9 +211,9 @@ public abstract class DevUtil {
      * Get the ServerTask to start the server, which can be in either "run" or "debug" mode
      * 
      * @return ServerTask the task to start the server
-     * @throws IOException if there was an error copying config files
+     * @throws Exception if there was an error copying/creating config files
      */
-    public abstract ServerTask getServerTask() throws IOException;
+    public abstract ServerTask getServerTask() throws Exception;
 
     private File serverDirectory;
     private File sourceDirectory;
@@ -223,6 +234,7 @@ public abstract class DevUtil {
     private String httpsPort;
     private final long compileWaitMillis;
     private AtomicBoolean inputUnavailable;
+    private int alternativeDebugPort = -1;
 
     public DevUtil(File serverDirectory, File sourceDirectory, File testSourceDirectory,
             File configDirectory, List<File> resourceDirs, boolean hotTests, boolean skipTests,
@@ -258,7 +270,7 @@ public abstract class DevUtil {
             ServerTask serverTask = null;
             try {
                 serverTask = getServerTask();
-            } catch (IOException e) {
+            } catch (Exception e) {
                 // not expected since server should already have been started
                 error("Could not get the server task for running tests.", e);
             }
@@ -453,7 +465,7 @@ public abstract class DevUtil {
             // Parse hostname, http, https ports for integration tests to use
             parseHostNameAndPorts(serverTask, messagesLogFile);
 
-        } catch (IOException | InterruptedException e) {
+        } catch (Exception e) {
             debug("Error starting server", e);
         }
     }
@@ -538,7 +550,7 @@ public abstract class DevUtil {
         }
         return null;
     }
-    
+
     public void cleanUpServerEnv() {
         // clean up server.env file
         File serverEnvFile;
@@ -562,7 +574,7 @@ public abstract class DevUtil {
             error("Could not retrieve server.env: " + e.getMessage());
         }
     }
-    
+
     public void cleanUpTempConfig() {
         if (this.tempConfigPath != null){
             File tempConfig = this.tempConfigPath.toFile();
@@ -603,6 +615,18 @@ public abstract class DevUtil {
                 stopServer();
             }
         });
+    }
+
+    /**
+     * Gets a map of the environment variables to set for debug mode.
+     * 
+     * @param libertyDebugPort the debug port to use
+     */
+    public Map<String, String> getDebugEnvironmentVariables(int libertyDebugPort) throws IOException {
+        Map<String, String> map = new HashMap<String, String>();
+        map.put("WLP_DEBUG_SUSPEND", "n");
+        map.put("WLP_DEBUG_ADDRESS", String.valueOf(findAvailablePort(libertyDebugPort)));
+        return map;
     }
 
     public void enableServerDebug(int libertyDebugPort) throws IOException {
@@ -650,25 +674,38 @@ public abstract class DevUtil {
     }
 
     /**
-     * Finds an available port.
+     * Finds an available port. If the preferred port is not available, returns a
+     * random available port and caches the result, which will override the
+     * preferredPort if this method is called again.
      * 
-     * @return The specified preferred port is available. If not, returns a random available port.
-     * @throws IOException if it could not find any available port, or there was an error when opening a server socket regardless of port.
+     * @return An available port.
+     * @throws IOException if it could not find any available port, or there was an
+     *                     error when opening a server socket regardless of port.
      */
     public int findAvailablePort(int preferredPort) throws IOException {
+        int portToTry = preferredPort;
+        if (alternativeDebugPort != -1) {
+            portToTry = alternativeDebugPort;
+        }
+
         ServerSocket serverSocket = null;
         try {
             serverSocket = new ServerSocket();
             serverSocket.setReuseAddress(false);
-            // try binding to the loopback address at the preferred port
-            serverSocket.bind(new InetSocketAddress(InetAddress.getByName(null), preferredPort), 1);
+            // try binding to the loopback address at the port to try
+            serverSocket.bind(new InetSocketAddress(InetAddress.getByName(null), portToTry), 1);
             return serverSocket.getLocalPort();
         } catch (IOException e) {
             if (serverSocket != null) {
                 // if binding failed, try binding to a random port
                 serverSocket.bind(null, 1);
                 int availablePort = serverSocket.getLocalPort();
-                warn("The debug port " + preferredPort + " is not available.  Using " + availablePort + " as the debug port instead.");
+                if (portToTry == preferredPort) {
+                    warn("The debug port " + preferredPort + " is not available.  Using " + availablePort + " as the debug port instead.");
+                } else {
+                    debug("The previous debug port " + alternativeDebugPort + " is no longer available.  Using " + availablePort + " as the debug port instead.");
+                }
+                alternativeDebugPort = availablePort;
                 return availablePort;
             } else {
                 throw new IOException("Could not create a server socket for debugging.", e);
@@ -963,6 +1000,10 @@ public abstract class DevUtil {
                         debug("Processing events for watched directory: " + directory);
 
                         File fileChanged = new File(directory.toString(), changed.toString());
+                        if (ignoreFileOrDir(fileChanged)) {
+                            // skip this file or directory, and continue to the next file or directory
+                            continue;
+                        }
                         debug("Changed: " + changed + "; " + event.kind());
 
                         // resource file check
@@ -1111,13 +1152,49 @@ public abstract class DevUtil {
         FileUtils.copyDirectory(serverDirectory, tempConfig, new FileFilter() {
             public boolean accept(File pathname) {
                 String name = pathname.getName();
-                // ignore workarea and logs dirs from the server directory, since those can be changing
-                return !((name.equals("workarea") || name.equals("logs")) && pathname.isDirectory());
+                // skip:
+                // - ignore list
+                // - workarea and logs dirs from the server directory, since those can be changing
+                boolean skip = ignoreFileOrDir(pathname)
+                        || (pathname.isDirectory() && (name.equals("workarea") || name.equals("logs")));
+                return !skip;
             }
         }, true);
         copyFile(fileChanged, srcDir, tempConfig, targetFileName);
         checkConfigFile(fileChanged, tempConfig);
         cleanUpTempConfig();
+    }
+
+    /**
+     * Whether dev mode should ignore a file or directory.
+     * 
+     * @param file File or directory
+     * @return true if the file or directory should be ignored, false otherwise
+     */
+    private boolean ignoreFileOrDir(File file) {
+        String name = file.getName();
+        if (file.isDirectory()) {
+            for (String prefix : IGNORE_DIRECTORY_PREFIXES) {
+                if (name.startsWith(prefix)) {
+                    debug("Ignoring " + name);
+                    return true;
+                }
+            }
+        } else {
+            for (String prefix : IGNORE_FILE_PREFIXES) {
+                if (name.startsWith(prefix)) {
+                    debug("Ignoring " + name);
+                    return true;
+                }
+            }
+            for (String postfix : IGNORE_FILE_POSTFIXES) {
+                if (name.endsWith(postfix)) {
+                    debug("Ignoring " + name);
+                    return true;
+                }
+            }    
+        }
+        return false;
     }
 
     /**
