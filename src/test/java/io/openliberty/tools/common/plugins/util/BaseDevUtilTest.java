@@ -38,7 +38,7 @@ public class BaseDevUtilTest {
 
         public DevTestUtil(File serverDirectory, File sourceDirectory,
                 File testSourceDirectory, File configDirectory, List<File> resourceDirs, boolean hotTests, boolean skipTests) {
-            super(serverDirectory, sourceDirectory, testSourceDirectory, configDirectory, resourceDirs, hotTests, skipTests, false, false, null, 5, 500);
+            super(serverDirectory, sourceDirectory, testSourceDirectory, configDirectory, resourceDirs, hotTests, skipTests, false, false, null, 60, 5, 500, true);
         }
 
         @Override
@@ -145,6 +145,11 @@ public class BaseDevUtilTest {
 
         @Override
         public void runIntegrationTests() throws PluginScenarioException, PluginExecutionException {
+            // not needed for tests
+        }
+
+        @Override
+        public void redeployApp() throws PluginExecutionException {
             // not needed for tests
         }
         
