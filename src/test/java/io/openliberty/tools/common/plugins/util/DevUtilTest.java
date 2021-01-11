@@ -380,7 +380,7 @@ public class DevUtilTest extends BaseDevUtilTest {
 
     @Test
     public void testGetFileFromConfigDirectory() throws Exception {
-        DevUtil util = new DevTestUtil(null, null, null, this.configDirectory, null, false, false);
+        DevUtil util = new DevTestUtil(null, null, null, null, this.configDirectory, null, false, false);
 
         File tempTextFile = new File(configDirectory, "temp.txt");
         Files.write(tempTextFile.toPath(), "temp".getBytes());

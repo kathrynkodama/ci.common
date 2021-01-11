@@ -46,6 +46,7 @@ import java.nio.file.WatchKey;
 import java.nio.file.WatchService;
 import java.nio.file.Watchable;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -74,8 +75,19 @@ import javax.tools.JavaFileObject;
 import javax.tools.StandardJavaFileManager;
 import javax.tools.StandardLocation;
 import javax.tools.ToolProvider;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.ParserConfigurationException;
+import javax.xml.transform.OutputKeys;
+import javax.xml.transform.Transformer;
 import javax.xml.transform.TransformerException;
+import javax.xml.transform.TransformerFactory;
+import javax.xml.transform.dom.DOMSource;
+import javax.xml.transform.stream.StreamResult;
+import javax.xml.xpath.XPathConstants;
+import javax.xml.xpath.XPathExpression;
+import javax.xml.xpath.XPathExpressionException;
+import javax.xml.xpath.XPathFactory;
 
 import com.sun.nio.file.SensitivityWatchEventModifier;
 
@@ -85,6 +97,11 @@ import org.apache.commons.io.monitor.FileAlterationListenerAdaptor;
 import org.apache.commons.io.monitor.FileAlterationObserver;
 
 import org.apache.maven.artifact.versioning.ComparableVersion;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+import org.xml.sax.SAXException;
 
 import io.openliberty.tools.ant.ServerTask;
 import io.openliberty.tools.common.plugins.config.ServerConfigDropinXmlDocument;
@@ -127,6 +144,8 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
     private static final int LIBERTY_DEFAULT_HTTPS_PORT = 9443;
     private static final int LIBERTY_DEFAULT_DEBUG_PORT = 7777;
     private static final int DOCKER_TIMEOUT = 20; // seconds
+
+    private static final String DEVC_METADATA_FILE = "liberty-devc-metadata.xml";
 
     /**
      * Log debug
@@ -294,7 +313,7 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
 
     /** If user stopped dev mode manually, this is true. If an external process caused dev mode to stop, this is false */
     private AtomicBoolean devStop;
-    
+
     private String hostName;
     private String httpPort;
     private String httpsPort;
@@ -341,6 +360,7 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
     protected AtomicBoolean hasFeaturesSh;
     protected AtomicBoolean serverFullyStarted;
     private final File buildDirectory;
+    private File devcMetadataFile;
 
     public DevUtil(File buildDirectory, File serverDirectory, File sourceDirectory, File testSourceDirectory, File configDirectory, File projectDirectory,
             List<File> resourceDirs, boolean hotTests, boolean skipTests, boolean skipUTs, boolean skipITs,
@@ -652,6 +672,11 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
             // that the server stopped
             setDevStop(false);
 
+            // creating dev mode metadata file
+            if (container) {
+                initializeDevMetadataFile();
+            }
+
             // If there were already logs from a previous server run, wait for it to be updated.
             if (logsExist) {
                 final AtomicBoolean messagesModified = new AtomicBoolean(false);
@@ -761,6 +786,10 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
             }
             // Parse hostname, http, https ports for integration tests to use
             parseHostNameAndPorts(serverTask, messagesLogFile);
+
+            if (container) {
+                getLibertyVersionFromContainer();
+            }
         } catch (IOException e) {
             throw new PluginExecutionException("An error occurred while starting the server: " + e.getMessage(), e);
         }
@@ -772,6 +801,7 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
      * Throw an exception if there is a problem with the version.
      */
     private static final String MIN_DOCKER_VERSION = "18.03.0"; // Must use Docker 18.03.0 or higher
+
     private void checkDockerVersion() throws PluginExecutionException {
         String versionCmd = "docker version --format {{.Client.Version}}";
         String dockerVersion = execDockerCmd(versionCmd, DOCKER_TIMEOUT);
@@ -1157,6 +1187,7 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
             info("Starting Docker container...");
             String startContainerCommand = getContainerCommand();
             info(startContainerCommand);
+            logLibertyContainerName();
             dockerRunProcess = getRunProcess(startContainerCommand);
             execDockerCmdAndLog(dockerRunProcess, 0);
         } catch (IOException e) {
@@ -1322,6 +1353,7 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
             // see if docker run command (container) is still running before trying to stop it.
             if (dockerRunProcess != null && dockerRunProcess.isAlive()) {
                 info("Stopping container...");
+                logDevStop();
                 String dockerStopCmd = "docker stop " + containerName;
                 debug("Stopping container " + containerName);
                 execDockerCmd(dockerStopCmd, DOCKER_TIMEOUT + 20); // allow extra time for server shutdown
@@ -2325,7 +2357,6 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
             final ThreadPoolExecutor executor, List<String> compileArtifactPaths, List<String> testArtifactPaths, File serverXmlFile,
             File bootstrapPropertiesFile, File jvmOptionsFile) throws Exception {
         this.buildFile = buildFile;
-        this.outputDirectory = outputDirectory;
         this.serverXmlFile = serverXmlFile;
         this.bootstrapPropertiesFile = bootstrapPropertiesFile;
         this.jvmOptionsFile = jvmOptionsFile;
@@ -3854,6 +3885,130 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
 
     public String getContainerName() {
         return containerName;
+    }
+
+    /**
+     * Get the Liberty version from the running container
+     */
+    public void getLibertyVersionFromContainer() {
+        String libertyVersionCommand = "docker exec " + containerName
+                + " grep com.ibm.websphere.productVersion /liberty/lib/versions/openliberty.properties";
+        String cmdResult = execDockerCmd(libertyVersionCommand, 600, false);
+        if (cmdResult != null) {
+            String version = cmdResult.substring(cmdResult.indexOf("=") + 1, cmdResult.length());
+            updateLibertyVersionMetadata(version.trim());
+        }
+    }
+
+    /**
+     * Create the dev mode metadata file
+     */
+    public File initializeDevMetadataFile() {
+        try {
+            if (this.serverDirectory.exists()) {
+                File libertyDevMetadataFile = new File(this.buildDirectory, DEVC_METADATA_FILE);
+                if (libertyDevMetadataFile.exists()) {
+                    libertyDevMetadataFile.delete();
+                }
+                if (libertyDevMetadataFile.createNewFile()) {
+                    this.devcMetadataFile = libertyDevMetadataFile;
+                    SimpleDateFormat sdf = new SimpleDateFormat("[yyyy-MM-dd, HH:mm:ss:SSS z]");
+                    updateLibertyMetadataFile("startedTimestamp", sdf.format(System.currentTimeMillis()), true);
+                    return libertyDevMetadataFile;
+                }
+            }
+            return null;
+        } catch (IOException e) {
+            debug("Unable to create " + DEVC_METADATA_FILE + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Update metadata file with timestamp of when dev mode was stopped
+     */
+    public void logDevStop() {
+        SimpleDateFormat sdf = new SimpleDateFormat("[yyyy-MM-dd, HH:mm:ss:SSS z]");
+        updateLibertyMetadataFile("stoppedTimestamp", sdf.format(System.currentTimeMillis()), false);
+    }
+
+    /**
+     * Update metadata file with the Liberty version
+     * 
+     * @param version Liberty version
+     */
+    public void updateLibertyVersionMetadata(String version) {
+        updateLibertyMetadataFile("libertyVersion", version, false);
+    }
+
+    /**
+     * Update metadata file with the container name
+     */
+    public void logLibertyContainerName() {
+        if (containerName != null) {
+            updateLibertyMetadataFile("containerName", containerName, false);
+        }
+    }
+
+    private void updateLibertyMetadataFile(String tag, String value, boolean init) {
+        try {
+            if (this.devcMetadataFile != null && this.devcMetadataFile.exists()) {
+                DocumentBuilderFactory docFactory = DocumentBuilderFactory.newInstance();
+                DocumentBuilder docBuilder = docFactory.newDocumentBuilder();
+                Document doc;
+                if (init) {
+                    doc = docBuilder.newDocument();
+                    Element rootElem = doc.createElement("devModeMetadata");
+                    doc.appendChild(rootElem);
+                    Element started = doc.createElement(tag);
+                    started.appendChild(doc.createTextNode(value));
+                    rootElem.appendChild(started);
+                } else {
+                    doc = docBuilder.parse(this.devcMetadataFile);
+                    Node rootElem = doc.getFirstChild();
+                    rootElem.normalize();
+                    if (rootElem != null) {
+                        NodeList existingElem = doc.getElementsByTagName(tag);
+                        if (existingElem.getLength() != 0) {
+                            Node existingElemNode = existingElem.item(0);
+                            existingElemNode.setTextContent(value);
+                        } else {
+                            Element newElem = doc.createElement(tag);
+                            newElem.appendChild(doc.createTextNode(value));
+                            rootElem.appendChild(newElem);
+                        }
+                    }
+                }
+                Transformer transformer = TransformerFactory.newInstance().newTransformer();
+                transformer.setOutputProperty(OutputKeys.METHOD, "xml");
+                transformer.setOutputProperty(OutputKeys.ENCODING, "UTF-8");
+                transformer.setOutputProperty(OutputKeys.INDENT, "yes");
+                transformer.setOutputProperty("{http://xml.apache.org/xslt}indent-amount", "4");
+                
+                // transformer adds whitespace and new lines, trim these out upon update
+                trimWhitespace(doc);
+                DOMSource source = new DOMSource(doc);
+                StreamResult result = new StreamResult(this.devcMetadataFile);
+                transformer.transform(source, result);
+            }
+        } catch (IOException | SAXException | ParserConfigurationException | TransformerException e) {
+            debug("Unable to write to " + DEVC_METADATA_FILE + ": " + e.getMessage());
+        }
+    }
+
+    private static void trimWhitespace(Document targetDoc) {
+        try {
+            String XPATH_WHITESPACE_EXPRESSION = "//text()[normalize-space(.) = '']";
+            targetDoc.getDocumentElement().normalize();
+            XPathExpression xpath = XPathFactory.newInstance().newXPath().compile(XPATH_WHITESPACE_EXPRESSION);
+            NodeList matchingNodes = (NodeList) xpath.evaluate(targetDoc, XPathConstants.NODESET);
+
+            for (int idx = 0; idx < matchingNodes.getLength(); idx++) {
+                matchingNodes.item(idx).getParentNode().removeChild(matchingNodes.item(idx));
+            }
+        } catch (XPathExpressionException e) {
+            // do nothing
+        }
     }
 
 }
